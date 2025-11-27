@@ -1,0 +1,640 @@
+@tool
+# mapBake2D.gd - Bake MAP0.MUL → tile_heights.res + tiletex_info.res, then build MeshInstance2D blocks
+# v0.3.0  (mesh-based diamond grid per block; manual bake; editor-safe; negative UV inset allowed)
+extends Node
+class_name MapBake2DEditor
+
+# ---------- Exports ----------
+@export_file("*") var mul_path: String = "" : set = set_mul_path
+@export var map_tiles: Vector2i = Vector2i(256, 256) : set = set_map_tiles
+@export var tiles_per_block: int = 16 : set = set_tiles_per_block
+@export var tile_px: Vector2 = Vector2(88, 88) : set = set_tile_px
+@export var heights_scale_px: float = 4.0 : set = set_heights_scale_px
+@export var ground_parent_path: NodePath = ^"GroundBlocks" : set = set_ground_parent_path
+@export var placeholder_texture_path: String = "res://assets/terrain/desertv0.png" : set = set_placeholder_texture_path
+
+# Grid overlay (CentrED-style)
+@export var show_tile_outlines: bool = true : set = set_show_tile_outlines
+@export var outline_color: Color = Color(1, 1, 0, 0.85) : set = set_outline_color
+@export var square_outline_color: Color = Color(1, 1, 0, 0.9)  # main diamond edges
+@export var square_diag_color: Color = Color(1, 1, 1, 0.65)   # optional p1->p3 diagonal
+@export var draw_square_diagonals: bool = true
+@export var grid_width_px: float = 1.0  # visual thickness of overlay lines (tri-quad width)
+
+# Shading controls (fake lighting via vertex colors)
+@export var use_vertex_shading: bool = true : set = set_use_vertex_shading
+@export_range(0.0, 2.0, 0.01) var shade_strength: float = 0.8 : set = set_shade_strength
+@export_range(0.0, 1.0, 0.01) var shade_ambient: float = 0.25 : set = set_shade_ambient
+
+# Sun direction in map space (for fake lighting)
+# Azimuth 0 degrees = +X, increasing counterclockwise in XZ plane.
+# For an isometric map rotated 45 degrees, southwest light is about 225 degrees azimuth.
+@export_range(0.0, 360.0, 1.0) var light_azimuth_deg: float = 225.0 : set = set_light_azimuth_deg
+@export_range(0.0, 89.0, 1.0) var light_elevation_deg: float = 45.0 : set = set_light_elevation_deg
+
+# Global transparency for terrain
+@export_range(0.0, 1.0, 0.01) var base_alpha: float = 1.0 : set = set_base_alpha
+
+# Axis fixes
+@export var flip_y: bool = false : set = set_flip_y
+@export var swap_xy: bool = false : set = set_swap_xy
+
+# World centering
+@export var map_center_offset: Vector2 = Vector2.ZERO : set = set_map_center_offset
+
+# PNG-only controls
+@export var tex_rot_deg: float = 45.0 : set = set_tex_rot_deg
+@export var uv_inset_px: float = -18.0 : set = set_uv_inset_px  # may be negative to expand sampling
+
+# Editor controls
+@export var bake_now: bool = false : set = _trigger_bake
+@export var overlay_tile_limit: int = 16384   # disable overlay when total tiles exceed this
+@export var max_block_for_outlines: int = 64  # skip outlines if tiles_per_block > this (mesh is cheap; keep generous)
+@export var debug_log: bool = true
+
+# ---------- Constants ----------
+const PATH_TILE_HEIGHTS := "res://assets/data/tile_heights.res"
+const PATH_TEX_INFO := "res://assets/data/tiletex_info.res"
+const PATH_TILE_REG := "res://assets/data/tile_registry.res"
+
+# ---------- Internals ----------
+var _ground_parent: Node2D
+var _mat: ShaderMaterial
+var _tex_size: Vector2 = Vector2.ONE
+var _square_outlines_visible: bool = false  # toggled by Ctrl+O
+var _shade_light_dir: Vector3 = Vector3(0.45, 1.0, 0.35) # derived from azimuth/elevation
+
+# ---------- Ready ----------
+func _ready() -> void:
+	_log("--- MapBake2D READY (editor:%s) ---" % [Engine.is_editor_hint()])
+	_ensure_ground_parent()
+	_center_parent()
+	_setup_material()
+	_ensure_tile_registry()
+	_ensure_input_actions()
+	_update_light_dir()
+	_set_material_alpha()
+	# Lightweight preview on load if no MUL selected
+	_editor_build(true if mul_path.is_empty() else false)
+
+# Hotkey: Ctrl + O toggles CentrED-style outlines
+func _ensure_input_actions() -> void:
+	if not InputMap.has_action("toggle_square_outlines"):
+		InputMap.add_action("toggle_square_outlines")
+		var ev := InputEventKey.new()
+		ev.keycode = KEY_O
+		ev.ctrl_pressed = true
+		InputMap.action_add_event("toggle_square_outlines", ev)
+
+func _unhandled_input(_event: InputEvent) -> void:
+	if Input.is_action_just_pressed("toggle_square_outlines"):
+		_square_outlines_visible = not _square_outlines_visible
+		get_tree().call_group("square_outlines", "set", "visible", _square_outlines_visible)
+		get_tree().call_group("tile_outlines", "set", "visible", _square_outlines_visible)
+
+# ---------- Setters (manual bake; no auto rebuild) ----------
+func set_mul_path(v: String) -> void: mul_path = v
+func set_map_tiles(v: Vector2i) -> void: map_tiles = v; _center_parent()
+func set_tiles_per_block(v: int) -> void: tiles_per_block = max(1, v)
+func set_tile_px(v: Vector2) -> void: tile_px = v; _center_parent()
+func set_heights_scale_px(v: float) -> void: heights_scale_px = v
+func set_ground_parent_path(v: NodePath) -> void: ground_parent_path = v; _ensure_ground_parent()
+func set_placeholder_texture_path(v: String) -> void: placeholder_texture_path = v; _update_shader_texture()
+
+func set_show_tile_outlines(v: bool) -> void:
+	show_tile_outlines = v
+	get_tree().call_group("tile_outlines", "set", "visible", show_tile_outlines)
+	get_tree().call_group("square_outlines", "set", "visible", show_tile_outlines and _square_outlines_visible)
+
+func set_outline_color(v: Color) -> void:
+	outline_color = v
+	for n in get_tree().get_nodes_in_group("tile_outlines"):
+		if n is Line2D:
+			n.default_color = outline_color
+
+func set_use_vertex_shading(v: bool) -> void:
+	use_vertex_shading = v
+
+func set_shade_strength(v: float) -> void:
+	shade_strength = max(v, 0.0)
+
+func set_shade_ambient(v: float) -> void:
+	shade_ambient = clamp(v, 0.0, 1.0)
+
+func set_light_azimuth_deg(v: float) -> void:
+	light_azimuth_deg = fmod(v, 360.0)
+	_update_light_dir()
+
+func set_light_elevation_deg(v: float) -> void:
+	light_elevation_deg = clamp(v, 0.0, 89.0)
+	_update_light_dir()
+
+func set_base_alpha(v: float) -> void:
+	base_alpha = clamp(v, 0.0, 1.0)
+	_set_material_alpha()
+
+func set_flip_y(v: bool) -> void: flip_y = v
+func set_swap_xy(v: bool) -> void: swap_xy = v
+func set_map_center_offset(v: Vector2) -> void: map_center_offset = v; _center_parent()
+
+func set_tex_rot_deg(v: float) -> void:
+	tex_rot_deg = v
+	if _mat:
+		_mat.set_shader_parameter("u_uv_rot_deg", tex_rot_deg)
+
+func set_uv_inset_px(v: float) -> void:
+	# allow negative to expand sampling; user uses -18 which hides seams after rotation
+	uv_inset_px = v
+	_update_uv_inset_uniform()
+
+# ---------- Manual bake ----------
+func _trigger_bake(_v: bool) -> void:
+	bake_now = false
+	if not Engine.is_editor_hint():
+		return
+	_editor_build(false)
+
+# ---------- Build orchestration ----------
+func _editor_build(preview_only: bool) -> void:
+	if preview_only or mul_path.is_empty():
+		_build_flat_preview()
+		return
+	if bake_from_mul():
+		build_all_blocks()
+	else:
+		_build_flat_preview()
+
+# ---------- Setup ----------
+func _ensure_ground_parent() -> void:
+	_ground_parent = get_node_or_null(ground_parent_path) as Node2D
+	if _ground_parent == null:
+		var gb := Node2D.new()
+		gb.name = "GroundBlocks"
+		add_child(gb)
+		_ground_parent = gb
+		ground_parent_path = ^"GroundBlocks"
+
+func _center_parent() -> void:
+	if _ground_parent:
+		_ground_parent.position = map_center_offset
+
+func _setup_material() -> void:
+	_mat = ShaderMaterial.new()
+	var sh := Shader.new()
+	sh.code = """
+	shader_type canvas_item;
+	uniform sampler2D u_tex;
+	uniform float u_uv_rot_deg = 0.0;
+	uniform vec2 u_uv_inset = vec2(0.0);
+	uniform float u_base_alpha = 1.0;
+
+	vec2 rotate_uv(vec2 uv, float deg){
+		float a = radians(deg);
+		float c = cos(a);
+		float s = sin(a);
+		vec2 p = uv - vec2(0.5);
+		vec2 r = vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+		return r + vec2(0.5);
+	}
+
+	void fragment(){
+		vec2 uv = rotate_uv(UV, u_uv_rot_deg);
+		vec2 lo = u_uv_inset;
+		vec2 hi = vec2(1.0) - u_uv_inset;
+		uv = clamp(uv, lo, hi);
+		uv = (uv - lo) / max(hi - lo, vec2(1e-6));
+
+		vec4 tex_col = texture(u_tex, uv);
+		vec4 shaded = tex_col * COLOR; // COLOR is interpolated vertex color here
+		shaded.a *= u_base_alpha;
+		COLOR = shaded;
+	}
+	"""
+	_mat.shader = sh
+	_update_shader_texture()
+	_mat.set_shader_parameter("u_uv_rot_deg", tex_rot_deg)
+	_update_uv_inset_uniform()
+	_set_material_alpha()
+
+func _update_shader_texture() -> void:
+	if not _mat:
+		return
+	var tex := load(placeholder_texture_path)
+	if tex is Texture2D:
+		_mat.set_shader_parameter("u_tex", tex)
+		_tex_size = Vector2(tex.get_width(), tex.get_height())
+	else:
+		_mat.set_shader_parameter("u_tex", null)
+		_tex_size = Vector2.ONE
+		push_warning("Texture not found at %s" % placeholder_texture_path)
+	_update_uv_inset_uniform()
+
+func _update_uv_inset_uniform() -> void:
+	if not _mat:
+		return
+	var inset_uv := Vector2(
+		uv_inset_px / max(_tex_size.x, 1.0),
+		uv_inset_px / max(_tex_size.y, 1.0)
+	)
+	_mat.set_shader_parameter("u_uv_inset", inset_uv)
+
+func _set_material_alpha() -> void:
+	if _mat:
+		_mat.set_shader_parameter("u_base_alpha", base_alpha)
+
+func _ensure_tile_registry() -> void:
+	if not ResourceLoader.exists(PATH_TILE_REG):
+		var reg := Resource.new()
+		reg.set_meta("schema", "tile_registry_v1")
+		ResourceSaver.save(reg, PATH_TILE_REG)
+
+# ---------- MUL reading ----------
+func _get_i8(f: FileAccess) -> int:
+	var b: int = f.get_8()
+	return b - 256 if b >= 128 else b
+
+func bake_from_mul() -> bool:
+	var result := _read_map_mul(mul_path, map_tiles)
+	if not result.get("ok", false):
+		return false
+
+	var tile_ids: PackedInt32Array = result["tile_ids"]
+	var corner_heights: PackedInt32Array = result["corner_heights"]
+
+	var heights_res := Resource.new()
+	heights_res.set_meta("w", map_tiles.x + 1)
+	heights_res.set_meta("h", map_tiles.y + 1)
+	heights_res.set_meta("data", corner_heights)
+	ResourceSaver.save(heights_res, PATH_TILE_HEIGHTS)
+
+	var tex_res := Resource.new()
+	tex_res.set_meta("w", map_tiles.x)
+	tex_res.set_meta("h", map_tiles.y)
+	tex_res.set_meta("data", tile_ids)
+	ResourceSaver.save(tex_res, PATH_TEX_INFO)
+	return true
+
+func _read_map_mul(path: String, size_tiles: Vector2i) -> Dictionary:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		push_error("Cannot open MAP0.MUL: %s" % path)
+		return { "ok": false }
+
+	var W: int = size_tiles.x
+	var H: int = size_tiles.y
+	var bx_count: int = int(ceil(W / 8.0))
+	var by_count: int = int(ceil(H / 8.0))
+	const BLOCK_SIZE := 196
+
+	var tile_id_per_tile := PackedInt32Array(); tile_id_per_tile.resize(W * H)
+	var z_per_tile := PackedInt32Array(); z_per_tile.resize(W * H)
+
+	for bx in range(bx_count):
+		for by in range(by_count):
+			var block_index: int = bx * by_count + by
+			var seek_pos: int = block_index * BLOCK_SIZE
+			if seek_pos + BLOCK_SIZE > f.get_length():
+				continue
+			f.seek(seek_pos)
+			f.get_32() # header
+			for cy in range(8):
+				for cx in range(8):
+					if f.get_position() + 3 > f.get_length():
+						break
+					var tid: int = int(f.get_16() & 0xFFFF)
+					var z: int = _get_i8(f)
+					var x: int = bx * 8 + cx
+					var y: int = by * 8 + cy
+					if x < W and y < H:
+						var idx: int = y * W + x
+						tile_id_per_tile[idx] = tid
+						z_per_tile[idx] = z
+	f.close()
+
+	# Optional axis fixes
+	if swap_xy:
+		var tmp_ids := PackedInt32Array(); tmp_ids.resize(W * H)
+		var tmp_z := PackedInt32Array(); tmp_z.resize(W * H)
+		for y in range(H):
+			for x in range(W):
+				if y < W and x < H:
+					tmp_ids[x * W + y] = tile_id_per_tile[y * W + x]
+					tmp_z[x * W + y] = z_per_tile[y * W + x]
+		tile_id_per_tile = tmp_ids
+		z_per_tile = tmp_z
+
+	if flip_y:
+		var half := H >> 1
+		for y in range(half):
+			var y2: int = H - 1 - y
+			for x in range(W):
+				var a: int = y * W + x
+				var b: int = y2 * W + x
+				var tmp_id: int = tile_id_per_tile[a]
+				tile_id_per_tile[a] = tile_id_per_tile[b]
+				tile_id_per_tile[b] = tmp_id
+				var tmp_zv: int = z_per_tile[a]
+				z_per_tile[a] = z_per_tile[b]
+				z_per_tile[b] = tmp_zv
+
+	# Per-tile Z → per-corner average
+	var corner_heights := PackedInt32Array(); corner_heights.resize((W + 1) * (H + 1))
+	for cy in range(H + 1):
+		for cx in range(W + 1):
+			var sum := 0
+			var count := 0
+			if cx > 0 and cy > 0:
+				sum += z_per_tile[(cy - 1) * W + (cx - 1)]; count += 1
+			if cx < W and cy > 0:
+				sum += z_per_tile[(cy - 1) * W + cx]; count += 1
+			if cx > 0 and cy < H:
+				sum += z_per_tile[cy * W + (cx - 1)]; count += 1
+			if cx < W and cy < H:
+				sum += z_per_tile[cy * W + cx]; count += 1
+			corner_heights[cy * (W + 1) + cx] = int(round(float(sum) / max(count, 1)))
+
+	return { "ok": true, "tile_ids": tile_id_per_tile, "corner_heights": corner_heights }
+
+# ---------- Mesh builders ----------
+func build_all_blocks() -> void:
+	_clear_blocks()
+
+	var heights_res := ResourceLoader.load(PATH_TILE_HEIGHTS)
+	var tex_res := ResourceLoader.load(PATH_TEX_INFO)
+	if heights_res == null or tex_res == null:
+		_build_flat_preview()
+		return
+
+	var H_w: int = int(heights_res.get_meta("w"))
+	var H_corners: PackedInt32Array = heights_res.get_meta("data")
+	var T_w: int = int(tex_res.get_meta("w"))
+	var T_h: int = int(tex_res.get_meta("h"))
+
+	var blocks_x: int = int(ceil(float(T_w) / float(tiles_per_block)))
+	var blocks_y: int = int(ceil(float(T_h) / float(tiles_per_block)))
+
+	for by in range(blocks_y):
+		for bx in range(blocks_x):
+			var block_node := Node2D.new()
+			block_node.name = "Block_%d_%d" % [bx, by]
+			_ground_parent.add_child(block_node)
+
+			var mesh_instance := MeshInstance2D.new()
+			mesh_instance.name = "Mesh"
+			mesh_instance.material = _mat
+			mesh_instance.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+			mesh_instance.texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED
+			mesh_instance.mesh = _build_block_mesh(bx, by, T_w, T_h, H_corners, H_w)
+			block_node.add_child(mesh_instance)
+
+			# optional very-light corner lattice (kept)
+			if show_tile_outlines:
+				var outline := Line2D.new()
+				outline.name = "Outline_Corners"
+				outline.default_color = outline_color
+				outline.width = 1.0
+				outline.antialiased = true
+				outline.visible = show_tile_outlines
+				_add_corner_lattice(outline, bx, by, T_w, T_h, H_corners, H_w)
+				outline.add_to_group("tile_outlines")
+				block_node.add_child(outline)
+
+			# Mesh-based diamond grid (fast and correct)
+			_add_grid_mesh(block_node, bx, by, T_w, T_h, H_corners, H_w)
+
+# Lightweight preview when no MUL path
+func _build_flat_preview() -> void:
+	_clear_blocks()
+	var W: int = map_tiles.x
+	var Ht: int = map_tiles.y
+	var H_corners := PackedInt32Array(); H_corners.resize((W + 1) * (Ht + 1))
+
+	var blocks_x: int = int(ceil(float(W) / float(tiles_per_block)))
+	var blocks_y: int = int(ceil(float(Ht) / float(tiles_per_block)))
+
+	for by in range(blocks_y):
+		for bx in range(blocks_x):
+			var block_node := Node2D.new()
+			block_node.name = "Block_%d_%d" % [bx, by]
+			_ground_parent.add_child(block_node)
+
+			var mesh_instance := MeshInstance2D.new()
+			mesh_instance.name = "Mesh"
+			mesh_instance.material = _mat
+			mesh_instance.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+			mesh_instance.texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED
+			mesh_instance.mesh = _build_block_mesh(bx, by, W, Ht, H_corners, W + 1)
+			block_node.add_child(mesh_instance)
+
+			if show_tile_outlines:
+				var outline := Line2D.new()
+				outline.name = "Outline_Corners"
+				outline.default_color = outline_color
+				outline.width = 1.0
+				outline.antialiased = true
+				outline.visible = show_tile_outlines
+				_add_corner_lattice(outline, bx, by, W, Ht, H_corners, W + 1)
+				outline.add_to_group("tile_outlines")
+				block_node.add_child(outline)
+
+			_add_grid_mesh(block_node, bx, by, W, Ht, H_corners, W + 1)
+
+func _build_block_mesh(bx: int, by: int, tw: int, th: int, H: PackedInt32Array, Hw: int) -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var x0: int = bx * tiles_per_block
+	var y0: int = by * tiles_per_block
+	var x1: int = min(x0 + tiles_per_block, tw)
+	var y1: int = min(y0 + tiles_per_block, th)
+
+	for ty in range(y0, y1):
+		for tx in range(x0, x1):
+			var p0 := _iso_pos(tx,     ty,     H, Hw)
+			var p1 := _iso_pos(tx + 1, ty,     H, Hw)
+			var p2 := _iso_pos(tx + 1, ty + 1, H, Hw)
+			var p3 := _iso_pos(tx,     ty + 1, H, Hw)
+
+			# Per-corner shading (fake lighting from height field)
+			var c0 := _shade_color_for_corner(tx,     ty,     H, Hw)
+			var c1 := _shade_color_for_corner(tx + 1, ty,     H, Hw)
+			var c2 := _shade_color_for_corner(tx + 1, ty + 1, H, Hw)
+			var c3 := _shade_color_for_corner(tx,     ty + 1, H, Hw)
+
+			# Upper triangle (p0, p1, p2)
+			st.set_uv(Vector2(0, 0))
+			st.set_color(c0)
+			st.add_vertex(Vector3(p0.x, p0.y, 0))
+
+			st.set_uv(Vector2(1, 0))
+			st.set_color(c1)
+			st.add_vertex(Vector3(p1.x, p1.y, 0))
+
+			st.set_uv(Vector2(1, 1))
+			st.set_color(c2)
+			st.add_vertex(Vector3(p2.x, p2.y, 0))
+
+			# Lower triangle (p0, p2, p3)
+			st.set_uv(Vector2(0, 0))
+			st.set_color(c0)
+			st.add_vertex(Vector3(p0.x, p0.y, 0))
+
+			st.set_uv(Vector2(1, 1))
+			st.set_color(c2)
+			st.add_vertex(Vector3(p2.x, p2.y, 0))
+
+			st.set_uv(Vector2(0, 1))
+			st.set_color(c3)
+			st.add_vertex(Vector3(p3.x, p3.y, 0))
+
+	return st.commit()
+
+# ---------- Grid helpers ----------
+# (1) Lightweight corner lattice in a single Line2D
+func _add_corner_lattice(line: Line2D, bx: int, by: int, tw: int, th: int, H: PackedInt32Array, Hw: int) -> void:
+	line.clear_points()
+	var x0: int = bx * tiles_per_block
+	var y0: int = by * tiles_per_block
+	var x1: int = min(x0 + tiles_per_block, tw)
+	var y1: int = min(y0 + tiles_per_block, th)
+	for ty in range(y0, y1 + 1):
+		for tx in range(x0, x1 + 1):
+			line.add_point(_iso_pos(tx, ty, H, Hw))
+
+# (2) Mesh-based diamond grid (edges as thin quads) - one MeshInstance2D per block
+func _add_grid_mesh(block_node: Node2D, bx: int, by: int, tw: int, th: int, H: PackedInt32Array, Hw: int) -> void:
+	var total_tiles := map_tiles.x * map_tiles.y
+	if not show_tile_outlines:
+		return
+	if total_tiles > overlay_tile_limit:
+		return
+	if tiles_per_block > max_block_for_outlines:
+		return
+
+	var x0: int = bx * tiles_per_block
+	var y0: int = by * tiles_per_block
+	var x1: int = min(x0 + tiles_per_block, tw)
+	var y1: int = min(y0 + tiles_per_block, th)
+
+	# main diamond edges (square_outline_color)
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for ty in range(y0, y1):
+		for tx in range(x0, x1):
+			var p0 := _iso_pos(tx,     ty,     H, Hw)
+			var p1 := _iso_pos(tx + 1, ty,     H, Hw)
+			var p2 := _iso_pos(tx + 1, ty + 1, H, Hw)
+			var p3 := _iso_pos(tx,     ty + 1, H, Hw)
+			_edge_quad(st, p0, p1, grid_width_px) # top
+			_edge_quad(st, p0, p3, grid_width_px) # left
+			if tx == x1 - 1:
+				_edge_quad(st, p1, p2, grid_width_px) # right border
+			if ty == y1 - 1:
+				_edge_quad(st, p3, p2, grid_width_px) # bottom border
+
+	var mesh := st.commit()
+	var mi := MeshInstance2D.new()
+	mi.name = "GridEdges"
+	mi.mesh = mesh
+	mi.self_modulate = square_outline_color
+	mi.visible = _square_outlines_visible
+	mi.add_to_group("square_outlines")
+	block_node.add_child(mi)
+
+	# optional diagonal p1->p3 per tile (square_diag_color)
+	if draw_square_diagonals:
+		var st2 := SurfaceTool.new()
+		st2.begin(Mesh.PRIMITIVE_TRIANGLES)
+		for ty in range(y0, y1):
+			for tx in range(x0, x1):
+				var p1 := _iso_pos(tx + 1, ty,     H, Hw)
+				var p3 := _iso_pos(tx,     ty + 1, H, Hw)
+				_edge_quad(st2, p1, p3, grid_width_px)
+		var mesh2 := st2.commit()
+		var mi2 := MeshInstance2D.new()
+		mi2.name = "GridDiag"
+		mi2.mesh = mesh2
+		mi2.self_modulate = square_diag_color
+		mi2.visible = _square_outlines_visible
+		mi2.add_to_group("square_outlines")
+		block_node.add_child(mi2)
+
+# Build a thin rectangle around segment a->b (two triangles)
+func _edge_quad(st: SurfaceTool, a: Vector2, b: Vector2, width_px: float) -> void:
+	var dir := (b - a)
+	var len := dir.length()
+	if len <= 0.00001:
+		return
+	var n := dir.orthogonal().normalized() * (width_px * 0.5)
+	var v0 := a - n
+	var v1 := a + n
+	var v2 := b + n
+	var v3 := b - n
+	st.add_vertex(Vector3(v0.x, v0.y, 0))
+	st.add_vertex(Vector3(v1.x, v1.y, 0))
+	st.add_vertex(Vector3(v2.x, v2.y, 0))
+	st.add_vertex(Vector3(v0.x, v0.y, 0))
+	st.add_vertex(Vector3(v2.x, v2.y, 0))
+	st.add_vertex(Vector3(v3.x, v3.y, 0))
+
+# ---------- Geometry / shading helpers ----------
+func _derived_tile_dims() -> Vector2:
+	var w: float = max(float(tile_px.x), 1.0)
+	var h: float = max(float(tile_px.y), 1.0)
+	return Vector2(w, h)
+
+func _iso_pos(ix: int, iy: int, H: PackedInt32Array, Hw: int) -> Vector2:
+	var dims := _derived_tile_dims()
+	var w: float = dims.x
+	var h: float = dims.y
+	var z: float = -float(_corner_h(ix, iy, H, Hw)) * heights_scale_px
+	return Vector2(
+		(ix - iy) * (w * 0.5),
+		(ix + iy) * (h * 0.5) + z
+	)
+
+func _corner_h(ix: int, iy: int, H: PackedInt32Array, Hw: int) -> int:
+	if ix < 0 or iy < 0 or iy * Hw + ix >= H.size():
+		return 0
+	return H[iy * Hw + ix]
+
+# Approximate corner normal from neighboring heights (map-space)
+func _corner_normal(ix: int, iy: int, H: PackedInt32Array, Hw: int) -> Vector3:
+	var h_l := float(_corner_h(ix - 1, iy, H, Hw))
+	var h_r := float(_corner_h(ix + 1, iy, H, Hw))
+	var h_u := float(_corner_h(ix, iy - 1, H, Hw))
+	var h_d := float(_corner_h(ix, iy + 1, H, Hw))
+
+	var sx := h_l - h_r
+	var sz := h_u - h_d
+	var n := Vector3(sx, 2.0, sz)
+	return n.normalized()
+
+# Convert corner normal to a grayscale vertex color
+func _shade_color_for_corner(ix: int, iy: int, H: PackedInt32Array, Hw: int) -> Color:
+	if not use_vertex_shading:
+		return Color(1, 1, 1, 1)
+
+	var n := _corner_normal(ix, iy, H, Hw)
+	var ld := _shade_light_dir
+	var d := ld.dot(n)  # [-1, 1]
+	var s := d * shade_strength + shade_ambient
+	s = clamp(s, 0.0, 1.0)
+	return Color(s, s, s, 1.0)
+
+func _update_light_dir() -> void:
+	var az := deg_to_rad(light_azimuth_deg)
+	var el := deg_to_rad(light_elevation_deg)
+	var x := cos(az) * cos(el)
+	var y := sin(el)
+	var z := sin(az) * cos(el)
+	_shade_light_dir = Vector3(x, y, z).normalized()
+
+func _clear_blocks() -> void:
+	if _ground_parent == null:
+		return
+	for c in _ground_parent.get_children():
+		c.queue_free()
+
+func _log(msg: String) -> void:
+	if debug_log:
+		print("[MapBake2D] %s" % msg)
